@@ -1,1 +1,330 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Buat project Android
+        run: |
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ModemZTE"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          kotlin.code.style=official
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
 
+          android {
+              namespace = "com.example.modem"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.modem"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="Modem ZTE"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/example/modem
+          cat > app/src/main/java/com/example/modem/ZteModemClient.kt <<'EOF'
+          package com.example.modem
+
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.security.MessageDigest
+
+          /**
+           * Klien untuk API ubus (JSON-RPC) modem ZTE di http://192.168.0.1
+           *
+           * PENTING: semua fungsi ini memanggil jaringan, jadi harus dijalankan di
+           * Dispatchers.IO (bukan main thread).
+           *
+           * Gradle:  implementation("com.squareup.okhttp3:okhttp:4.12.0")
+           * Manifest: <uses-permission android:name="android.permission.INTERNET" />
+           *           <application android:usesCleartextTraffic="true" ... />   // modem pakai HTTP
+           */
+          class ZteModemClient(private val baseUrl: String = "http://192.168.0.1") {
+
+              private val http = OkHttpClient()
+              private val nullSession = "0".repeat(32)
+              private var nextId = 1
+
+              var session: String = nullSession
+                  private set
+
+              val isLoggedIn get() = session != nullSession
+
+              // BELUM TERVERIFIKASI: fungsi paswordAlgorithmsCookie milik web admin tidak
+              // ada di file yang dikirim. Pada firmware ZTE sejenis, isinya SHA-256 dengan
+              // hasil hex huruf besar. Kalau login gagal, bagian ini yang perlu dicek.
+              private fun sha256Upper(s: String): String =
+                  MessageDigest.getInstance("SHA-256")
+                      .digest(s.toByteArray())
+                      .joinToString("") { "%02X".format(it) }
+
+              /** Satu panggilan ubus. Mengembalikan objek hasil, atau null kalau gagal. */
+              fun call(obj: String, method: String, args: JSONObject = JSONObject()): JSONObject? {
+                  val req = JSONObject()
+                      .put("jsonrpc", "2.0")
+                      .put("id", nextId++)
+                      .put("method", "call")
+                      .put("params", JSONArray().put(session).put(obj).put(method).put(args))
+
+                  val body = JSONArray().put(req).toString()
+                      .toRequestBody("application/json".toMediaType())
+
+                  val request = Request.Builder()
+                      .url("$baseUrl/ubus/?t=${System.currentTimeMillis()}")
+                      .header("Z-Mode", if (isLoggedIn) "1" else "0")
+                      .header("Z-Tag", method)
+                      .post(body)
+                      .build()
+
+                  http.newCall(request).execute().use { resp ->
+                      val text = resp.body?.string() ?: return null
+                      val first = JSONArray(text).optJSONObject(0) ?: return null
+                      val result = first.optJSONArray("result") ?: return null
+                      return if (result.optInt(0, -1) == 0) result.optJSONObject(1) else null
+                  }
+              }
+
+              /** Login dengan password admin. Username diasumsikan "admin" (belum dipastikan). */
+              fun login(password: String, username: String = "admin"): Boolean {
+                  val salt = call("zwrt_web", "web_login_info")
+                      ?.optString("zte_web_sault") ?: return false
+
+                  val hashed = sha256Upper(sha256Upper(password) + salt)
+
+                  val r = call(
+                      "zwrt_web", "web_login",
+                      JSONObject().put("username", username).put("password", hashed)
+                  ) ?: return false
+
+                  if (r.optString("result") != "0") return false
+                  session = r.getString("ubus_rpc_session")
+                  return true
+              }
+
+              /** Sinyal: network_type, lte_rsrp, lte_snr, nr5g_rsrp, nr5g_snr, nr5g_action_band, dll. */
+              fun signal(): JSONObject? = call("zte_nwinfo_api", "nwinfo_get_netinfo")
+
+              /** Jumlah perangkat: access_total_num, wireless_num, lan_num, offline_num. */
+              fun deviceCount(): JSONObject? = call("zwrt_router.api", "router_get_user_list_num")
+
+              /** Status router (kemungkinan berisi kecepatan realtime, status koneksi, dll). */
+              fun routerStatus(): JSONObject? = call("zwrt_router.api", "router_get_status")
+
+              /** Daftar perangkat Wi-Fi yang tersambung (maks 64 per halaman). */
+              fun wirelessDevices(): JSONObject? = call(
+                  "zwrt_router.api", "router_wireless_access_list",
+                  JSONObject().put("start_id", 1).put("end_id", 64)
+              )
+
+              /** Putus / sambung data seluler. */
+              fun setMobileData(enable: Boolean, moduleName: String): JSONObject? = call(
+                  "zwrt_data", "set_wwaniface",
+                  JSONObject().put("source_module", moduleName).put("cid", 1)
+                      .put("enable", if (enable) 1 else 0)
+              )
+
+              /** Reboot modem. moduleName = nilai RPC_MODULE_NAME dari config web admin (belum diketahui). */
+              fun reboot(moduleName: String): JSONObject? = call(
+                  "zwrt_mc.device.manager", "device_reboot",
+                  JSONObject().put("moduleName", moduleName)
+              )
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/modem
+          cat > app/src/main/java/com/example/modem/MainActivity.kt <<'EOF'
+          package com.example.modem
+
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.LaunchedEffect
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.json.JSONObject
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme {
+                          Surface(Modifier.fillMaxSize()) { Screen() }
+                      }
+                  }
+              }
+          }
+
+          private fun JSONObject?.v(key: String): String =
+              this?.optString(key, "").orEmpty().ifEmpty { "-" }
+
+          @Composable
+          fun Screen() {
+              val client = remember { ZteModemClient() }
+              val scope = rememberCoroutineScope()
+              var password by remember { mutableStateOf("") }
+              var loggedIn by remember { mutableStateOf(false) }
+              var message by remember { mutableStateOf("") }
+              var signal by remember { mutableStateOf<JSONObject?>(null) }
+              var devices by remember { mutableStateOf<JSONObject?>(null) }
+
+              LaunchedEffect(loggedIn) {
+                  while (loggedIn) {
+                      val r = withContext(Dispatchers.IO) {
+                          runCatching { client.signal() to client.deviceCount() }
+                      }
+                      r.onSuccess {
+                          signal = it.first
+                          devices = it.second
+                          message = ""
+                      }
+                      r.onFailure { message = "Gagal membaca modem: " + it.message }
+                      delay(3000)
+                  }
+              }
+
+              Column(
+                  Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()),
+                  verticalArrangement = Arrangement.spacedBy(8.dp)
+              ) {
+                  Text("Modem ZTE", style = MaterialTheme.typography.headlineSmall)
+                  if (!loggedIn) {
+                      OutlinedTextField(
+                          value = password,
+                          onValueChange = { password = it },
+                          label = { Text("Password admin") },
+                          visualTransformation = PasswordVisualTransformation(),
+                          singleLine = true,
+                          modifier = Modifier.fillMaxWidth()
+                      )
+                      Button(onClick = {
+                          scope.launch {
+                              message = "Masuk..."
+                              val ok = withContext(Dispatchers.IO) {
+                                  runCatching { client.login(password) }.getOrDefault(false)
+                              }
+                              loggedIn = ok
+                              message = if (ok) "" else "Login gagal (cek password atau algoritma hash)"
+                          }
+                      }) { Text("Login") }
+                  } else {
+                      Text("Jaringan: " + signal.v("network_type"))
+                      Text("Band: " + signal.v("nr5g_action_band") + "   Channel: " + signal.v("nr5g_action_channel"))
+                      Text("RSRP: " + signal.v("nr5g_rsrp") + " dBm   RSRQ: " + signal.v("nr5g_rsrq") + " dB")
+                      Text("SINR: " + signal.v("nr5g_snr") + " dB   RSSI: " + signal.v("nr5g_rssi"))
+                      Text("PCI: " + signal.v("nr5g_pci") + "   Cell ID: " + signal.v("nr5g_cell_id") + "   BW: " + signal.v("nr5g_bandwidth"))
+                      Text("Perangkat Wi-Fi: " + devices.v("wireless_num"))
+                      Text("Data mentah:", style = MaterialTheme.typography.titleSmall)
+                      Text(signal?.toString(2) ?: "-", style = MaterialTheme.typography.bodySmall)
+                  }
+                  if (message.isNotEmpty()) Text(message)
+              }
+          }
+          EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: modem-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
