@@ -101,24 +101,45 @@ jobs:
           import org.json.JSONArray
           import org.json.JSONObject
           import java.security.MessageDigest
+          import java.security.SecureRandom
+          import java.security.cert.X509Certificate
           import java.util.concurrent.TimeUnit
+          import javax.net.ssl.SSLContext
+          import javax.net.ssl.TrustManager
+          import javax.net.ssl.X509TrustManager
 
           /**
-           * Klien untuk API ubus (JSON-RPC) modem ZTE di http://192.168.0.1
+           * Klien untuk API ubus (JSON-RPC) modem ZTE di https://192.168.0.1
            *
            * PENTING: semua fungsi ini memanggil jaringan, jadi harus dijalankan di
            * Dispatchers.IO (bukan main thread).
            *
            * Gradle:  implementation("com.squareup.okhttp3:okhttp:4.12.0")
            * Manifest: <uses-permission android:name="android.permission.INTERNET" />
-           *           <application android:usesCleartextTraffic="true" ... />   // modem pakai HTTP
            */
-          class ZteModemClient(private val baseUrl: String = "http://192.168.0.1") {
+          class ZteModemClient(private val baseUrl: String = "https://192.168.0.1") {
 
-              private val http = OkHttpClient.Builder()
-                  .connectTimeout(5, TimeUnit.SECONDS)
-                  .readTimeout(8, TimeUnit.SECONDS)
-                  .build()
+              private val modemHost: String = java.net.URI(baseUrl).host
+
+              // Modem memakai sertifikat HTTPS buatan sendiri (self-signed), jadi tidak ada
+              // di daftar sertifikat Android. Sertifikat diterima HANYA untuk alamat modem
+              // ini (hostnameVerifier di bawah), bukan untuk situs lain.
+              private val trustModemCert = object : X509TrustManager {
+                  override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
+                  override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) {}
+                  override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+              }
+
+              private val http: OkHttpClient = run {
+                  val ctx = SSLContext.getInstance("TLS")
+                  ctx.init(null, arrayOf<TrustManager>(trustModemCert), SecureRandom())
+                  OkHttpClient.Builder()
+                      .sslSocketFactory(ctx.socketFactory, trustModemCert)
+                      .hostnameVerifier { host, _ -> host == modemHost }
+                      .connectTimeout(5, TimeUnit.SECONDS)
+                      .readTimeout(8, TimeUnit.SECONDS)
+                      .build()
+              }
               private val nullSession = "0".repeat(32)
               private var nextId = 1
 
@@ -355,3 +376,4 @@ jobs:
         with:
           name: modem-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+          
