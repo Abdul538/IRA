@@ -101,6 +101,7 @@ jobs:
           import org.json.JSONArray
           import org.json.JSONObject
           import java.security.MessageDigest
+          import java.util.concurrent.TimeUnit
 
           /**
            * Klien untuk API ubus (JSON-RPC) modem ZTE di http://192.168.0.1
@@ -114,18 +115,23 @@ jobs:
            */
           class ZteModemClient(private val baseUrl: String = "http://192.168.0.1") {
 
-              private val http = OkHttpClient()
+              private val http = OkHttpClient.Builder()
+                  .connectTimeout(5, TimeUnit.SECONDS)
+                  .readTimeout(8, TimeUnit.SECONDS)
+                  .build()
               private val nullSession = "0".repeat(32)
               private var nextId = 1
+
+              /** Balasan mentah terakhir dari modem (untuk diagnosa). */
+              var lastRaw: String = ""
+                  private set
 
               var session: String = nullSession
                   private set
 
               val isLoggedIn get() = session != nullSession
 
-              // BELUM TERVERIFIKASI: fungsi paswordAlgorithmsCookie milik web admin tidak
-              // ada di file yang dikirim. Pada firmware ZTE sejenis, isinya SHA-256 dengan
-              // hasil hex huruf besar. Kalau login gagal, bagian ini yang perlu dicek.
+              // Sama dengan paswordAlgorithmsCookie di web admin: SHA-256, hex huruf besar.
               private fun sha256Upper(s: String): String =
                   MessageDigest.getInstance("SHA-256")
                       .digest(s.toByteArray())
@@ -151,27 +157,42 @@ jobs:
 
                   http.newCall(request).execute().use { resp ->
                       val text = resp.body?.string() ?: return null
+                      lastRaw = text
                       val first = JSONArray(text).optJSONObject(0) ?: return null
                       val result = first.optJSONArray("result") ?: return null
                       return if (result.optInt(0, -1) == 0) result.optJSONObject(1) else null
                   }
               }
 
-              /** Login dengan password admin. Username diasumsikan "admin" (belum dipastikan). */
-              fun login(password: String, username: String = "admin"): Boolean {
-                  val salt = call("zwrt_web", "web_login_info")
-                      ?.optString("zte_web_sault") ?: return false
+              /**
+               * Login. Mengembalikan null kalau berhasil, atau teks diagnosa kalau gagal.
+               * Hash sudah sesuai web admin: SHA-256, hex huruf besar, dua kali dengan salt.
+               */
+              fun login(password: String, username: String = "admin"): String? {
+                  return try {
+                      val info = call("zwrt_web", "web_login_info")
+                      val salt = info?.optString("zte_web_sault")
+                      if (salt.isNullOrEmpty()) {
+                          return "Gagal ambil salt. Balasan modem:\n" + lastRaw
+                      }
 
-                  val hashed = sha256Upper(sha256Upper(password) + salt)
+                      val hashed = sha256Upper(sha256Upper(password) + salt)
 
-                  val r = call(
-                      "zwrt_web", "web_login",
-                      JSONObject().put("username", username).put("password", hashed)
-                  ) ?: return false
-
-                  if (r.optString("result") != "0") return false
-                  session = r.getString("ubus_rpc_session")
-                  return true
+                      val r = call(
+                          "zwrt_web", "web_login",
+                          JSONObject().put("username", username).put("password", hashed)
+                      )
+                      if (r == null) {
+                          return "Login ditolak. Balasan modem:\n" + lastRaw
+                      }
+                      if (r.optString("result") != "0") {
+                          return "Login gagal (result=" + r.optString("result") + "). Balasan modem:\n" + lastRaw
+                      }
+                      session = r.getString("ubus_rpc_session")
+                      null
+                  } catch (e: Exception) {
+                      "Error jaringan: " + e.javaClass.simpleName + ": " + e.message
+                  }
               }
 
               /** Sinyal: network_type, lte_rsrp, lte_snr, nr5g_rsrp, nr5g_snr, nr5g_action_band, dll. */
@@ -256,6 +277,7 @@ jobs:
           fun Screen() {
               val client = remember { ZteModemClient() }
               val scope = rememberCoroutineScope()
+              var username by remember { mutableStateOf("admin") }
               var password by remember { mutableStateOf("") }
               var loggedIn by remember { mutableStateOf(false) }
               var message by remember { mutableStateOf("") }
@@ -284,6 +306,13 @@ jobs:
                   Text("Modem ZTE", style = MaterialTheme.typography.headlineSmall)
                   if (!loggedIn) {
                       OutlinedTextField(
+                          value = username,
+                          onValueChange = { username = it },
+                          label = { Text("Username") },
+                          singleLine = true,
+                          modifier = Modifier.fillMaxWidth()
+                      )
+                      OutlinedTextField(
                           value = password,
                           onValueChange = { password = it },
                           label = { Text("Password admin") },
@@ -294,11 +323,9 @@ jobs:
                       Button(onClick = {
                           scope.launch {
                               message = "Masuk..."
-                              val ok = withContext(Dispatchers.IO) {
-                                  runCatching { client.login(password) }.getOrDefault(false)
-                              }
-                              loggedIn = ok
-                              message = if (ok) "" else "Login gagal (cek password atau algoritma hash)"
+                              val err = withContext(Dispatchers.IO) { client.login(password, username) }
+                              loggedIn = err == null
+                              message = err ?: ""
                           }
                       }) { Text("Login") }
                   } else {
